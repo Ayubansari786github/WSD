@@ -1,0 +1,215 @@
+Source Code
+
+#include <Wire.h>
+#include <SoftwareSerial.h>
+#include <AltSoftSerial.h>
+#include <TinyGPS++.h>
+#include <Adafruit_Fingerprint.h>
+#include <LiquidCrystal_I2C.h>
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+SoftwareSerial SIM900(10, 11); // GSM RX=10, TX=11
+AltSoftSerial fingerSerial; // Fingerprint RX=8, TX=9
+TinyGPSPlus gps;
+Adafruit_Fingerprint finger(&fingerSerial);
+#define BUTTON_PIN 2
+#define BUZZER_PIN 3
+const char DEST_NUMBER[] = "+919028118064"; // Replace with your phone number
+double latitude = 0.0;
+double longitude = 0.0;
+bool haveFix = false;
+bool alertSent = false;
+// NEW VARIABLES
+bool waitingForVerification = false;
+unsigned long verificationStart = 0;
+const unsigned long VERIFY_TIME = 15000; // 15 seconds
+// Manual fallback coordinates (if GPS has no fix)
+double manualLat = 19.123456; // Change to your latitude
+double manualLon = 72.987654; // Change to your longitude
+unsigned long lastLCDupdate = 0;
+const unsigned long LCD_UPDATE_MS = 1000;
+String lcdLine0 = "";
+String lcdLine1 = "";
+void setup() {
+Serial.begin(9600); // GPS
+SIM900.begin(9600);
+fingerSerial.begin(57600);
+finger.begin(57600);
+pinMode(BUTTON_PIN, INPUT_PULLUP);
+pinMode(BUZZER_PIN, OUTPUT);
+digitalWrite(BUZZER_PIN, LOW);
+lcd.init();
+lcd.backlight();
+lcdClearAndPrint("Women Safety", "Starting...");
+if (!finger.verifyPassword()) {
+lcdClearAndPrint("Sensor Error!", "Check Fingerprint");
+while (1);
+}
+lcdClearAndPrint("System Ready", "");
+// Initialize GSM text mode
+delay(1000);
+SIM900.println("AT");
+delay(500);
+SIM900.println("AT+CMGF=1");
+delay(500);
+SIM900.println("AT+CSCS=\"GSM\"");
+delay(500);
+SIM900.println("AT+CSMP=17,167,0,0");
+delay(500);
+}
+void loop() {
+// Read GPS data (for SMS only)
+while (Serial.available() > 0) {
+char c = Serial.read();
+gps.encode(c);
+haveFix = gps.location.isValid();
+if (haveFix) {
+latitude = gps.location.lat();
+longitude = gps.location.lng();
+}
+}
+// LCD Update
+if (millis() - lastLCDupdate >= LCD_UPDATE_MS) {
+lastLCDupdate = millis();
+updateLCDStatus();
+}
+int btn = digitalRead(BUTTON_PIN);
+//
+// 1. BUTTON PRESSED → START 15 SEC FINGER VERIFICATION
+//
+if (btn == LOW && !waitingForVerification && !alertSent) {
+waitingForVerification = true;
+verificationStart = millis();
+lcdClearAndPrint("Button Pressed!", "Scan Finger...");
+digitalWrite(BUZZER_PIN, HIGH);
+}
+//
+// 2. DURING WAIT TIME → CHECK IF FINGER VERIFIED
+//
+if (waitingForVerification) {
+int fid = getFingerPrintQuick();
+if (fid != -1) {
+// Finger verified → cancel emergency
+waitingForVerification = false;
+digitalWrite(BUZZER_PIN, LOW);
+lcdClearAndPrint("Verified!", "Alert Cancelled");
+delay(2000);
+lcdClearAndPrint("System Ready", "");
+return;
+}
+//
+// 3. IF NO FINGER SCAN WITHIN 15 SECONDS → SEND SMS
+//
+if (millis() - verificationStart >= VERIFY_TIME) {
+waitingForVerification = false;
+digitalWrite(BUZZER_PIN, HIGH);
+triggerAlert();
+return;
+}
+}
+// Reset alert
+if (btn == HIGH && alertSent) {
+digitalWrite(BUZZER_PIN, LOW);
+alertSent = false;
+lcdClearAndPrint("System Ready", "");
+}
+delay(50);
+}
+int getFingerPrintQuick() {
+int p = finger.getImage();
+if (p != FINGERPRINT_OK) return -1;
+p = finger.image2Tz();
+if (p != FINGERPRINT_OK) return -1;
+p = finger.fingerFastSearch();
+if (p != FINGERPRINT_OK) return -1;
+lcdClearAndPrint("Fingerprint OK", "Verified...");
+delay(600);
+return finger.fingerID;
+}
+void triggerAlert() {
+alertSent = true;
+digitalWrite(BUZZER_PIN, HIGH);
+String coords;
+// Use GPS if available, else fallback to manual coordinates
+if (haveFix) {
+coords = String(latitude, 6) + "," + String(longitude, 6);
+} else {
+coords = String(manualLat, 6) + "," + String(manualLon, 6);
+}
+String link = "https://maps.google.com/?q=" + coords;
+String sms = "Emergency! Location: " + link;
+lcdClearAndPrint("!!! EMERGENCY !!!", "Sending SMS...");
+Serial.println(sms);
+bool ok = sendSMS(sms);
+if (ok) {
+lcdClearAndPrint("Alert Sent!", coords.c_str());
+} else {
+lcdClearAndPrint("SMS Failed!", "Check SIM/power");
+}
+}
+bool sendSMS(String message) {
+SIM900.listen();
+delay(200);
+SIM900.println("AT+CMGF=1");
+delay(400);
+SIM900.println("AT+CSCS=\"GSM\"");
+delay(400);
+SIM900.println("AT+CSMP=17,167,0,0");
+delay(400);
+SIM900.print("AT+CMGS=\"");
+SIM900.print(DEST_NUMBER);
+SIM900.println("\"");
+delay(1000);
+unsigned long t = millis();
+while (millis() - t < 7000) {
+if (SIM900.find(">")) break;
+}
+delay(200);
+SIM900.print(message);
+delay(300);
+SIM900.write(26); // Ctrl+Z
+delay(5000);
+String resp = readSIMResponse(8000);
+Serial.print("SIM Response: "); Serial.println(resp)
+if (resp.indexOf("+CMGS:") != -1 || resp.indexOf("OK") != -1) {
+return true;
+}
+return false;
+}
+String readSIMResponse(unsigned long timeout) {
+unsigned long start = millis();
+String reply = "";
+while (millis() - start < timeout) {
+while (SIM900.available()) {
+char c = SIM900.read();
+reply += c;
+}
+}
+return reply;
+}
+void lcdClearAndPrint(const char* l0, const char* l1) {
+lcd.clear();
+lcd.setCursor(0, 0);
+lcd.print(l0);
+lcd.setCursor(0, 1);
+lcd.print(l1);
+lcdLine0 = String(l0);
+lcdLine1 = String(l1);
+}
+void updateLCDStatus() {
+if (waitingForVerification || alertSent) return;
+String line0 = "System Ready";
+String line1 = ""; // Always empty
+if (line0 != lcdLine0) {
+lcd.setCursor(0, 0);
+lcd.print(" ");
+lcd.setCursor(0, 0);
+lcd.print(line0);
+lcdLine0 = line0;
+if (line1 != lcdLine1) {
+lcd.setCursor(0, 1);
+lcd.print(" ");
+lcd.setCursor(0, 1);
+lcd.print(line1);
+lcdLine1 = line1;
+}
+}
